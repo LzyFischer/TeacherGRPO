@@ -1,0 +1,41 @@
+# Checkpoints
+ckpts/
+
+# Unsloth cache
+unsloth_compiled_cache/
+
+# Experiment tracking
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+
+# Logs (generated at runtime)
+logs/
+logs_eval/
+logs_teacher_eval/
+
+# Results (generated at runtime)
+results/
+results_final/
+results_teacher_final/
+
+# Workspace / intermediate data
+iterative_workspace/
+temp_data_seqkd/
+kl_partition_results/
+candidates/
+logs_batch_experiment/
+
+# LoRA model outputs
+grpo_trainer_lora_model*/
+
+# OS
+.DS_Store
+*.swp
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
