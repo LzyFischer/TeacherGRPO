@@ -1,0 +1,13 @@
+# CUDA GPU required. Install a torch build matching your CUDA first; vLLM and
+# Unsloth pin compatible torch versions, so installing them together is simplest.
+torch
+transformers
+accelerate
+peft
+trl
+unsloth
+vllm
+datasets
+pyyaml
+tqdm
+wandb
