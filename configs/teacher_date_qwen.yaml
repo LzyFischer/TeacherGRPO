@@ -1,0 +1,28 @@
+# python train_teacher.py --config configs/teacher_date_qwen.yaml
+# Command-line flags override values here.
+teacher_model: unsloth/Qwen2.5-3B-Instruct
+student_model: unsloth/Qwen2.5-0.5B-Instruct
+train_file: ./data/date/train.jsonl
+run_name: teacher
+num_epochs: 5
+
+teacher_lr: 2.0e-5
+batch_size: 4
+gradient_accumulation_steps: 32
+num_teacher_samples: 4
+max_length: 1024
+max_new_tokens: 1024
+
+# Reward weights
+w_verified: 0.4
+w_alignment: 0.6
+w_length: 0.6
+w_answer_pred: 0.4
+swlp_beta: 0.01
+swlp_temperature: 4
+n_answer_tokens: 10
+
+lora_r: 8
+lora_alpha: 16
+use_wandb: true
+save_steps: 20

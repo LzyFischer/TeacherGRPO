@@ -1,43 +1,31 @@
-from unsloth import FastLanguageModel
+"""Teacher-side reward for TeacherGRPO.
+
+For each teacher rollout the reward combines
+
+* **verified**    - 1 if the extracted answer is correct, else 0
+* **alignment**   - negative student/teacher divergence on the rollout, with a
+                    curriculum top1 -> top-k -> full KL over a growing share of
+                    the hardest tokens
+* **length**      - SWLP (Surprisal-Weighted Length Penalty): penalise reasoning
+                    steps that both student and teacher find unsurprising
+* **answer_pred** - cosine similarity between the student's hidden state on the
+                    last tokens and its embedding of the reference answer
+"""
+
+import gc
 import os
+from contextlib import nullcontext
+from typing import Dict, List, Tuple
+
 import torch
 import torch.nn.functional as F
-import argparse
-import yaml
-import warnings
-from datasets import load_dataset, Dataset
-from trl import GRPOConfig, GRPOTrainer
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from typing import List, Dict, Tuple, Optional, Union
-import math
-import wandb
-import json
-from contextlib import nullcontext
 
-# Import your custom data loader
-from load_data import load_data_source
-from utils import generalized_jsd_loss, KL_REGISTRY
+from teachergrpo.answers import extract_prediction, is_correct
+
 
 # -----------------------------------------------------------------------------
-# IMPORT FROM EVAL_VLLM (As requested)
+# Curriculum
 # -----------------------------------------------------------------------------
-# We import the registry and helper functions to handle different data types (Math, MCQ, etc.)
-from eval_vllm import (
-    DATASET_REGISTRY,
-    extract_prediction,
-    extract_reference,  # Added this import
-    math_answers_equal,
-    normalize_math_answer,
-)
-
-# Suppress warnings
-warnings.filterwarnings("ignore")
-# os.environ["VLLM_USE_V1"] = "1"
-
-# -----------------------------------------------------------------------------
-# Curriculum Learning Utilities
-# -----------------------------------------------------------------------------
-
 
 class CurriculumScheduler:
     """Manages curriculum progression across training steps."""
@@ -62,18 +50,14 @@ class CurriculumScheduler:
 
     def get_alignment_mode(self) -> str:
         """
-        Get current alignment mode for curriculum.
-        CE -> top1_kl -> topk_kl -> full_kl
+        Alignment mode for the current progress: top1_kl -> topk_kl -> full_kl.
         """
         progress = self.get_progress()
         if progress < 0.3:
-            return "top1_kl"  # Cross-entropy loss
+            return "top1_kl"  # CE against the teacher's argmax token
         elif progress < 0.9:
-            return "topk_kl"  # KL on top-1 predictions
-        elif progress < 1.0:
-            return "full_kl"  # KL on top-k predictions
-        else:
-            return "full_kl"  # Full KL divergence
+            return "topk_kl"  # KL over the teacher's top-k tokens
+        return "full_kl"  # KL over the full vocabulary
 
     def get_token_percentage(self) -> float:
         """
@@ -87,10 +71,7 @@ class CurriculumScheduler:
 
 
 # -----------------------------------------------------------------------------
-# Enhanced Reward Functions
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# NEW: SWLP (Surprisal-Weighted Length Penalty) Helper Functions
+# SWLP (Surprisal-Weighted Length Penalty)
 # -----------------------------------------------------------------------------
 
 
@@ -135,7 +116,6 @@ def compute_swlp_reward(
     temperature: float = 0.5,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Computes the Intersection of Unimportance Length Penalty.
     Only penalizes steps where BOTH Student and Teacher find the start 'unsurprising'.
     """
 
@@ -210,6 +190,10 @@ def compute_swlp_reward(
 
     # Return raw rewards and the mean unimportance for logging
     return rewards, intersection_unimp.mean()
+
+
+# -----------------------------------------------------------------------------
+# Curriculum alignment losses
 # -----------------------------------------------------------------------------
 
 def compute_top1_kl_efficient(
@@ -217,6 +201,7 @@ def compute_top1_kl_efficient(
     teacher_logits: torch.Tensor,
     temperature: float = 1.0,
 ) -> torch.Tensor:
+    """Cross-entropy of the student against the teacher's argmax token."""
     teacher_targets = teacher_logits.argmax(dim=-1)
     
     # Clamp to prevent logit explosion
@@ -245,9 +230,6 @@ def compute_topk_kl_efficient(
     device = student_logits.device
     loss_per_token = torch.zeros(batch_size, seq_len, device=device)
     
-    # Small epsilon to guard against division-by-zero (defensive; log_softmax doesn't require it)
-    epsilon = 1e-8 
-
     for b in range(batch_size):
         # 1. Get Teacher's Top-K
         topk_vals, topk_indices = teacher_logits[b].topk(k, dim=-1)
@@ -332,15 +314,10 @@ def compute_alignment_loss(
     teacher_logits: torch.Tensor,
     mask: torch.Tensor,
     mode: str,
-    beta: float = 0.5,  # Unused; kept for API compatibility
     temperature: float = 1.0,
     k: int = 100,
-    kl_fn=None,  # Unused; kept for API compatibility
 ) -> torch.Tensor:
-    """
-    Memory-efficient alignment loss.
-    Replaces the previous implementation; unused parameters are kept for API compatibility.
-    """
+    """Per-token alignment loss for the given curriculum mode, masked."""
     if mode == "ce" or mode == "top1_kl":
         loss_per_token = compute_top1_kl_efficient(
             student_logits, teacher_logits, temperature=temperature
@@ -356,7 +333,6 @@ def compute_alignment_loss(
     
     loss_per_token = loss_per_token * mask
     if torch.isnan(loss_per_token).any() or torch.isinf(loss_per_token).any():
-        # print("Warning: NaN or Inf detected in alignment loss, masking them out.")
         loss_per_token = torch.nan_to_num(loss_per_token, nan=0.0, posinf=0.0, neginf=0.0)
     return loss_per_token
 
@@ -382,17 +358,14 @@ class CurriculumRewardFunction:
         # Reward weights
         w_verified: float = 1.0,
         w_alignment: float = 0.5,
-        w_length: float = 0.2,  # This now controls the SWLP weight
+        w_length: float = 0.2,  # weight of the SWLP length reward
         w_answer_pred: float = 0.3,
-        # SWLP Hyperparameters (New)
-        swlp_beta: float = 0.02,  # The lambda penalty coefficient
-        swlp_temperature: float = 0.5,  # The sensitivity to surprisal
-        # Other
+        # SWLP hyperparameters
+        swlp_beta: float = 0.02,  # penalty coefficient
+        swlp_temperature: float = 0.5,  # sensitivity to surprisal
         n_answer_tokens: int = 20,
-        kl_type: str = "generalized_jsd",
         max_length: int = 2048,
     ):
-        self.kl_fn = KL_REGISTRY[kl_type]
         self.student_model = student_model
         self.teacher_model = teacher_model
         self.tokenizer = tokenizer
@@ -420,7 +393,6 @@ class CurriculumRewardFunction:
         self.last_metrics = {k: float(v) for k, v in metrics.items()}
 
     def _clear_memory(self):
-        import gc
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -470,16 +442,13 @@ class CurriculumRewardFunction:
         # =====================================================================
         # Pre-compute verified rewards (CPU only, cheap)
         # =====================================================================
-        verified_rewards = []
-        for completion, ref in zip(completion_texts, reference):
-            prediction = extract_prediction(completion, self.eval_type)
-            is_correct = False
-            if self.eval_type == "math":
-                is_correct = math_answers_equal(prediction, ref)
-            else:
-                is_correct = str(prediction).lower().strip() == str(ref).lower().strip()
-            verified_rewards.append(1.0 if is_correct else 0.0)
-        verified_rewards = torch.tensor(verified_rewards, device=self.device)
+        verified_rewards = torch.tensor(
+            [
+                1.0 if is_correct(extract_prediction(c, self.eval_type), ref, self.eval_type) else 0.0
+                for c, ref in zip(completion_texts, reference)
+            ],
+            device=self.device,
+        )
 
         # =====================================================================
         # Micro-batching strategy
@@ -574,7 +543,7 @@ class CurriculumRewardFunction:
                     completion_mask,
                     mode=alignment_mode, 
                     temperature=1.0,
-                    k=100  # Reduced from 1000 for memory efficiency
+                    k=100,
                 )
                 
                 token_mask = select_topk_tokens_by_kl(
@@ -664,7 +633,6 @@ class CurriculumRewardFunction:
         metrics = {
             "reward/final_mean": final_reward.mean().item(),
             "reward/verified_mean": verified_rewards.mean().item(),
-            # "reward/length_mean": length_norm.mean().item(),
             "reward/alignment_mean": alignment_norm.mean().item(),
             "reward/swlp_length_penalty_mean": length_norm.mean().item(),
             "reward/redundancy_score": mean_redundancy.item(),
@@ -674,331 +642,3 @@ class CurriculumRewardFunction:
         self._stash_metrics(metrics)
 
         return final_reward.cpu().tolist()
-
-
-# -----------------------------------------------------------------------------
-# Main Training Logic
-# -----------------------------------------------------------------------------
-
-
-def train_teacher(args):
-    # 1. Configuration
-    max_seq_length = args.max_length
-    lora_rank = args.lora_r
-
-    # -------------------------------------------------------------------------
-    # DYNAMIC DATASET DETECTION
-    # -------------------------------------------------------------------------
-    # If dataset_name not provided, infer from path (e.g., data/gsm8k/train.jsonl -> gsm8k)
-    dataset_name = args.dataset_name
-    if not dataset_name and args.train_file:
-        try:
-            # Assuming structure is .../dataset_name/filename
-            dataset_name = os.path.basename(os.path.dirname(args.train_file))
-        except Exception:
-            dataset_name = "default"
-
-    print(f"Detected Dataset Name: {dataset_name}")
-
-    # Look up registry for correct evaluation type
-    dataset_config = DATASET_REGISTRY.get(dataset_name, DATASET_REGISTRY.get("default"))
-    # If exact name match fails, try partial match (common pattern in registry)
-    if dataset_name not in DATASET_REGISTRY:
-        for k in DATASET_REGISTRY:
-            if dataset_name in k:
-                dataset_config = DATASET_REGISTRY[k]
-                break
-
-    eval_type = dataset_config.get("type", "text")
-    print(f"Using Evaluation Type: {eval_type}")
-
-    # -------------------------------------------------------------------------
-    # Load Data & Models
-    # -------------------------------------------------------------------------
-    print(f"Loading training data from: {args.train_file}")
-
-    try:
-        if args.train_file.endswith(".jsonl"):
-            ds = load_dataset("json", data_files={"train": args.train_file}, split="train")
-        else:
-            ds = load_dataset("json", data_files={"train": args.train_file}, field="instances", split="train")
-    except Exception as e:
-        # ATTEMPT 2: Fallback to Python JSON loading (Schema-agnostic)
-        print(f"Warning: load_dataset failed ({e}). Falling back to standard Python json/jsonl load.")
-        data = []
-        with open(args.train_file, "r", encoding="utf-8") as f:
-            if args.train_file.endswith(".jsonl"):
-                for line in f:
-                    if line.strip():
-                        try:
-                            data.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
-            else:
-                try:
-                    full_data = json.load(f)
-                    if isinstance(full_data, list):
-                        data = full_data
-                    elif isinstance(full_data, dict) and "instances" in full_data:
-                        data = full_data["instances"]
-                    else:
-                        # Try flat dict
-                        data = [full_data]
-                except Exception:
-                    data = []
-        ds = data  # ds is now a simple list of dicts
-         
-    if args.max_train_samples:
-        ds = ds.select(range(min(len(ds), args.max_train_samples)))
-    
-
-    steps_per_epoch = len(ds) // (args.batch_size * args.gradient_accumulation_steps)
-    if args.max_steps > 0:
-        total_steps = args.max_steps
-        print(f"Mode: Max Steps detected. Training will stop after {total_steps} steps (Overriding epochs).")
-    else:
-        total_steps = steps_per_epoch * args.num_epochs
-        print(f"Mode: Epoch based. Training will stop after {args.num_epochs} epochs (~{total_steps} steps).")
-
-    curriculum_scheduler = CurriculumScheduler(
-        total_steps=total_steps,
-        warmup_steps=args.curriculum_warmup_steps,
-    )
-
-    print(f"Loading Trainer Model: {args.teacher_model}")
-    is_lora_checkpoint = os.path.exists(os.path.join(args.teacher_model, "adapter_config.json"))
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.teacher_model,
-        max_seq_length=max_seq_length,
-        load_in_4bit=args.load_in_4bit,
-        fast_inference=True,
-        max_lora_rank=lora_rank,
-        gpu_memory_utilization=0.25,
-    )
-
-    if not is_lora_checkpoint:
-        model = FastLanguageModel.get_peft_model(
-            model,
-            r=lora_rank,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-            lora_alpha=args.lora_alpha,
-            use_gradient_checkpointing="unsloth",
-            random_state=args.seed,
-        )
-    else:
-        # Iter 2+: LoRA checkpoint loaded (Unsloth auto-loaded adapters)
-        print(f"Resuming training from LoRA checkpoint: {args.student_model}")
-
-        # Critical: Unsloth defaults to inference mode when loading adapters.
-        # We must explicitly enable training gradients for LoRA layers.
-        FastLanguageModel.for_training(model)
-
-    print(f"Loading Student Model for Rewards: {args.student_model}")
-    student_model, student_tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.student_model,
-        max_seq_length=max_seq_length,
-        load_in_4bit=True,
-        dtype=None,
-        gpu_memory_utilization=0.05,
-    )
-    FastLanguageModel.for_inference(student_model)
-
-    # Prepare Dataset
-    dataset_dict = {
-        "prompt": [],
-        "reference": []
-    }
-    
-    # CHANGED: Use formatter for prompt, but extract_reference for truth.
-    # Also removed hardcoded system prompt, using simple chat template.
-    formatter = dataset_config["formatter"]
-    
-    for row in ds:
-        try:
-            # Get prompt string from formatter (ignore formatter's response)
-            prompt_text, _ = formatter(row)
-            
-            # Get strict reference from helper
-            reference_text = extract_reference(row, eval_type)
-            
-            # Use standard user prompt structure (no system prompt)
-            dataset_dict["prompt"].append([
-                {"role": "user", "content": prompt_text}
-            ])
-            dataset_dict["reference"].append(reference_text)
-        except Exception as e:
-            print(f"Skipping row due to error: {e}")
-            continue
-
-    hf_dataset = Dataset.from_dict(dataset_dict)
-    print(f"Processed {len(hf_dataset)} training examples.")
-
-    # Initialize Reward Function with EVAL_TYPE
-    reward_function = CurriculumRewardFunction(
-        student_model=student_model,
-        teacher_model=model,
-        tokenizer=student_tokenizer,
-        curriculum_scheduler=curriculum_scheduler,
-        eval_type=eval_type,  # <--- PASSING THE EVAL TYPE
-        device="cuda",
-        w_verified=args.w_verified,
-        w_alignment=args.w_alignment,
-        w_length=args.w_length,
-        w_answer_pred=args.w_answer_pred,
-        n_answer_tokens=args.n_answer_tokens,
-        kl_type=args.kl_type,
-        swlp_beta=args.swlp_beta,
-        swlp_temperature=args.swlp_temperature,
-        max_length=args.max_new_tokens,
-    )
-
-    training_args = GRPOConfig(
-        output_dir=f"ckpts/{dataset_name}/{args.run_name}",
-        run_name=args.run_name,
-        learning_rate=args.teacher_lr,
-        weight_decay=0.0,
-        warmup_ratio=0.0,
-        lr_scheduler_type="constant",
-        optim="adamw_8bit",
-        logging_steps=1,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_generations=args.num_teacher_samples,
-        max_prompt_length=max_seq_length // 2,
-        max_completion_length=args.max_new_tokens,
-        max_steps=args.max_steps,
-        save_steps=args.save_steps if args.save_steps > 0 else 100,
-        max_grad_norm=1.0,
-        report_to="wandb" if args.use_wandb else "none",
-    )
-
-    trainer = GRPOTrainer(
-        model=model,
-        processing_class=tokenizer,
-        reward_funcs=[reward_function],
-        args=training_args,
-        train_dataset=hf_dataset,
-    )
-
-    # Custom Callback
-    from transformers import TrainerCallback
-
-    class CurriculumCallback(TrainerCallback):
-        def __init__(self, scheduler, reward_fn):
-            self.scheduler = scheduler
-            self.reward_fn = reward_fn
-
-        def on_train_begin(self, args, state, control, **kwargs):
-            """Define the X-axis metric when training starts."""
-            if state.is_world_process_zero and wandb.run is not None:
-                # Tell WandB: "For any metric matching 'reward/*', use 'train/global_step' as the X-axis"
-                wandb.define_metric("reward/*", step_metric="train/global_step")
-                wandb.define_metric("curriculum/*", step_metric="train/global_step")
-                wandb.define_metric("train/global_step", summary="max")  # Keep track of max step
-
-        def on_step_end(self, args, state, control, **kwargs):
-            self.scheduler.step()
-            metrics = getattr(self.reward_fn, "last_metrics", {}) or {}
-
-            if metrics:
-                print("[Rewards]")
-                for k in [
-                    "reward/final_mean",
-                    "reward/verified_mean",
-                    "reward/alignment_mean",
-                    "reward/length_mean",
-                    "reward/answer_pred_mean",
-                ]:
-                    if k in metrics:
-                        print(f" {k}: {metrics[k]:.4f}")
-
-            if state.is_world_process_zero and metrics and wandb.run is not None:
-                # 1. Add global_step to the metrics dict
-                metrics["train/global_step"] = state.global_step
-
-                # 2. Log WITHOUT the 'step' argument
-                # Let WandB handle the internal step counter naturally
-                wandb.log(metrics)
-
-            if state.global_step % 10 == 0:
-                print(
-                    f"\n[Curriculum] Step {state.global_step} | Progress: {self.scheduler.get_progress():.2%}"
-                )
-
-    trainer.add_callback(CurriculumCallback(curriculum_scheduler, reward_function))
-
-    print("Starting GRPO Training with Curriculum Learning...")
-    trainer.train()
-
-    model.save_lora(f"ckpts/{dataset_name}/{args.run_name}/final_lora")
-    # tokenizer
-    tokenizer.save_pretrained(f"ckpts/{dataset_name}/{args.run_name}/final_lora")
-    print(f"Training complete! Model saved to ckpts/{args.run_name}/final_lora")
-
-
-# -----------------------------------------------------------------------------
-# Argument Parsing
-# -----------------------------------------------------------------------------
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--teacher_model", type=str, default="unsloth/Qwen2.5-3B-Instruct")
-    parser.add_argument("--student_model", type=str, default="unsloth/Qwen2.5-0.5B-Instruct")
-    parser.add_argument("--train_file", type=str, default="./data/date/train.jsonl")
-    parser.add_argument("--dataset_name", type=str, default=None)
-    parser.add_argument("--max_train_samples", type=int, default=None)
-    parser.add_argument("--teacher_lr", type=float, default=2e-5)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=32)
-    parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=-1)
-    parser.add_argument("--max_length", type=int, default=1024)
-    parser.add_argument("--max_new_tokens", type=int, default=1024)
-    parser.add_argument("--num_teacher_samples", type=int, default=4)
-    parser.add_argument("--curriculum_warmup_steps", type=int, default=0)
-    parser.add_argument("--w_verified", type=float, default=0.4)
-    parser.add_argument("--w_alignment", type=float, default=0.6)
-    parser.add_argument("--w_length", type=float, default=0.6)
-    parser.add_argument("--w_answer_pred", type=float, default=0.4)
-    parser.add_argument("--swlp_beta", type=float, default=0.01, help="Penalty coefficient per redundant step")
-    parser.add_argument("--swlp_temperature", type=float, default=4, help="Temperature for unimportance prob")
-    parser.add_argument("--n_answer_tokens", type=int, default=10)
-    parser.add_argument("--load_in_4bit", type=bool, default=True)
-    parser.add_argument("--lora_r", type=int, default=8)
-    parser.add_argument("--lora_alpha", type=int, default=16)
-    parser.add_argument("--seed", type=int, default=3407)
-    parser.add_argument("--use_wandb", type=bool, default=True)
-    parser.add_argument("--run_name", type=str, default="teacher")
-    parser.add_argument("--save_steps", type=int, default=20)
-    parser.add_argument(
-        "--kl_type",
-        type=str,
-        default="reverse",
-        choices=["generalized_jsd", "forward", "reverse"],
-    )
-
-    args = parser.parse_args()
-
-    if args.config and os.path.exists(args.config):
-        with open(args.config, "r") as f:
-            config_dict = yaml.safe_load(f)
-        for key, value in config_dict.items():
-            if hasattr(args, key):
-                setattr(args, key, value)
-
-    return args
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    train_teacher(args)
